@@ -1,0 +1,138 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © StimuliNetwork
+
+//@version=5
+indicator("Stimuli Network", overlay=true)
+
+whipsaw_window = 5
+max_lookback = 5000
+
+var int best_fast = na
+var int best_slow = na
+var int min_whipsaws = 100000
+
+if bar_index == 100
+    int max_bars_to_scan = math.min(bar_index, max_lookback)
+    for fast = 8 to 20
+        for slow = fast + 1 to 21
+            int whipsaw_count = 0
+            int last_crossover_bar = na
+            bool last_cross_above = false
+            for i = 1 to max_bars_to_scan - whipsaw_window
+                float sma_fast_i = ta.sma(close[i], fast)
+                float sma_slow_i = ta.sma(close[i], slow)
+                float sma_fast_prev = ta.sma(close[i + 1], fast)
+                float sma_slow_prev = ta.sma(close[i + 1], slow)
+                bool cross_up = sma_fast_prev < sma_slow_prev and sma_fast_i > sma_slow_i
+                bool cross_down = sma_fast_prev > sma_slow_prev and sma_fast_i < sma_slow_i
+                if cross_up or cross_down
+                    if last_crossover_bar != na and i - last_crossover_bar <= whipsaw_window
+                        if cross_up != last_cross_above
+                            whipsaw_count += 1
+                    last_crossover_bar := i
+                    last_cross_above := cross_up
+            if whipsaw_count < min_whipsaws
+                min_whipsaws := whipsaw_count
+                best_fast := fast
+                best_slow := slow
+
+sma1 = not na(best_fast) ? ta.sma(close, best_fast) : na
+sma2 = not na(best_slow) ? ta.sma(close, best_slow) : na
+average_sma = (sma1 + sma2) / 2
+plot(average_sma, color=color.new(average_sma > average_sma[1] ? color.teal : color.maroon, 50), linewidth=1, style=plot.style_columns)
+
+plot(ta.ema(close, 20), color=color.new(close > ta.ema(close, 20) ? color.teal : color.maroon, 65), linewidth=3, style=plot.style_area)
+
+riskRewardRatio = input.float(2.0, title="Risk-Reward Ratio", group="General Settings")
+stopLossATRMultiplier = input.float(1.5, title="Stop Loss ATR Multiplier", group="General Settings")
+timeframeHigher = input.timeframe("", title="Higher Timeframe", group="General Settings")
+
+atr_val = ta.atr(14)
+stopLossDistance = stopLossATRMultiplier * atr_val
+takeProfitDistance = stopLossDistance * riskRewardRatio
+
+rsiLength = input.int(14, minval=1, title="RSI Length", group="RSI Settings")
+rsiSource = input.source(close, title="Source", group="RSI Settings")
+rsiHighValue = input.int(75, title="RSI Upper Threshold", group="RSI Settings")
+rsiLowValue = input.int(25, title="RSI Lower Threshold", group="RSI Settings")
+
+rsi = ta.rsi(rsiSource, rsiLength)
+htf_rsi_value = timeframeHigher != "" ? request.security(syminfo.tickerid, timeframeHigher, ta.rsi(rsiSource, rsiLength)) : rsi
+
+stochLength = input.int(14, title="Stochastic Length", group="Stochastic RSI Settings")
+k_val = ta.sma(ta.stoch(rsi, rsi, rsi, stochLength), 3)
+d_val = ta.sma(k_val, 3)
+
+htfRsiBullish = timeframeHigher == "" or htf_rsi_value > 50
+htfRsiBearish = timeframeHigher == "" or htf_rsi_value < 50
+
+isBullish = rsi > rsi[1] and k_val > d_val and htfRsiBullish
+isBearish = rsi < rsi[1] and k_val < d_val and htfRsiBearish
+
+buyCondition = ta.crossover(close, open) and low < open and isBullish
+sellCondition = ta.crossunder(close, open) and high > open and isBearish
+
+var float latestBuyAverage = na
+var float latestSellAverage = na
+var float buySL = na
+var float buyTP = na
+var float sellSL = na
+var float sellTP = na
+
+if buyCondition
+    latestBuyAverage := close
+    buySL := latestBuyAverage - stopLossDistance
+    buyTP := latestBuyAverage + takeProfitDistance
+    latestSellAverage := na
+    sellSL := na
+    sellTP := na
+if sellCondition
+    latestSellAverage := close
+    sellSL := latestSellAverage + stopLossDistance
+    sellTP := latestSellAverage - takeProfitDistance
+    latestBuyAverage := na
+    buySL := na
+    buyTP := na
+
+buyChanged = ta.change(latestBuyAverage)
+sellChanged = ta.change(latestSellAverage)
+
+buyColor = buyChanged ? color.lime : color.new(color.lime, 0)
+sellColor = sellChanged ? color.red : color.new(color.red, 0)
+
+buyPlot = plot(not na(latestBuyAverage) ? latestBuyAverage : na, title="Latest Buy", color=buyColor, linewidth=2)
+sellPlot = plot(not na(latestSellAverage) ? latestSellAverage : na, title="Latest Sell", color=sellColor, linewidth=2)
+
+plot(not na(buySL) ? buySL : na, title="Buy SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
+plot(not na(buyTP) ? buyTP : na, title="Buy TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+plot(not na(sellSL) ? sellSL : na, title="Sell SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
+plot(not na(sellTP) ? sellTP : na, title="Sell TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+
+if (not na(latestBuyAverage))
+    line.new(x1=bar_index, x2=bar_index, y1=low, y2=high, width=1, color=buyColor, style=line.style_dotted)
+
+if (not na(latestSellAverage))
+    line.new(x1=bar_index, x2=bar_index, y1=low, y2=high, width=1, color=sellColor, style=line.style_dotted)
+
+
+plotshape(buyCondition, title="Buy", location=location.abovebar, color=color.new(color.lime, 0), style=shape.triangleup, size=size.tiny)
+plotshape(sellCondition, title="Sell", location=location.belowbar, color=color.new(color.red, 0), style=shape.triangledown, size=size.tiny)
+
+fill(buyPlot, sellPlot, color=color.new(isBullish ? color.lime : isBearish ? color.red : color.gray, 0))
+
+showWickAnalysis = input.bool(false, "Show Previous Wick Analysis", group="Display Settings")
+
+prevHighWick = high[1]
+prevLowWick = low[1]
+prevMeanWick = (prevHighWick + prevLowWick) / 2
+
+plot(showWickAnalysis ? prevHighWick : na, title="Prev Top Wick", color=color.new(color.red, 80), linewidth=1, style=plot.style_circles)
+plot(showWickAnalysis ? prevLowWick : na, title="Prev Bottom Wick", color=color.new(color.green, 80), linewidth=1, style=plot.style_circles)
+plot(showWickAnalysis ? prevMeanWick : na, title="Prev Mean Wick", color=color.silver, style=plot.style_cross)
+
+if buyCondition
+    alert("Sniper Buy: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+if sellCondition
+    alert("Sniper Sell: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+//-- to God be the Glory
