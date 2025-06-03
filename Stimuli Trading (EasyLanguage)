@@ -1,0 +1,317 @@
+// EasyLanguage Conversion of Stimuli Network Indicator
+
+// Pine Script® original by StimuliNetwork
+// Subject to Mozilla Public License 2.0
+
+// Global constant for "no plot" values (alternative to 0 if 0 is a valid price)
+Define: NO_PLOT_VALUE (-1.2345e-10); // A very specific unlikely value for "na"
+
+Inputs:
+    WhipsawWindow(5),
+    MaxLookback(5000), // Used for optimization scan limit
+    RiskRewardRatio(2.0),
+    StopLossATRMultiplier(1.5),
+    // For HTF RSI: To use, add a Data2 stream to your chart with the desired higher timeframe.
+    // If TimeframeHigherSymbolActive is false, current timeframe RSI is used.
+    TimeframeHigherSymbolActive(false, "Use Higher Timeframe (Data2) for RSI?"), 
+    RSILength(14),
+    // RSISource(Close), // In EL, source is often explicit (e.g. Close). Pine's input.source is flexible. Defaulting to Close.
+    RSIHighValue(75, "RSI Upper Threshold (Info)"), // For conditions, not directly plotted as levels here
+    RSILowValue(25, "RSI Lower Threshold (Info)"),  // For conditions, not directly plotted as levels here
+    StochLength(14, "Stochastic Length (for StochRSI)"),
+    ShowWickAnalysis(false, "Show Previous Wick Analysis");
+
+Variables:
+    // Whipsaw Optimization State (calculated once)
+    BestFast(0), 
+    BestSlow(0), 
+    MinWhipsaws(100000),
+    onceWhipsawCalcDone(false), // Flag for one-time calculation
+
+    // SMAs from optimization
+    SMA1(NO_PLOT_VALUE),
+    SMA2(NO_PLOT_VALUE),
+    AverageSMA(NO_PLOT_VALUE),
+    ema20(0),
+
+    // ATR and SL/TP
+    AtrVal(0),
+    StopLossDistance(0),
+    TakeProfitDistance(0),
+
+    // RSI
+    rsiVal(0),
+    htfRsiValue(0), // Higher Timeframe RSI value
+
+    // Stochastic RSI
+    rawStochRSI(0),
+    kVal(0), // Smoothed %K of StochRSI
+    dVal(0), // Smoothed %D of StochRSI
+
+    // Conditions
+    htfRsiBullish(false),
+    htfRsiBearish(false),
+    isBullish(false),
+    isBearish(false),
+    buyCond(false),
+    sellCond(false),
+
+    // Trade State & SL/TP Values
+    latestBuyAverage(NO_PLOT_VALUE), 
+    latestSellAverage(NO_PLOT_VALUE), 
+    buySL(NO_PLOT_VALUE),
+    buyTP(NO_PLOT_VALUE),
+    sellSL(NO_PLOT_VALUE),
+    sellTP(NO_PLOT_VALUE),
+
+    // Plotting helpers for SL/TP (to handle "na" or breaks)
+    plotBuySL(NO_PLOT_VALUE),
+    plotBuyTP(NO_PLOT_VALUE),
+    plotSellSL(NO_PLOT_VALUE),
+    plotSellTP(NO_PLOT_VALUE),
+    
+    // Color calculation helpers
+    buyChanged(false),
+    sellChanged(false),
+
+    // Previous Wick Analysis
+    prevHighWick(NO_PLOT_VALUE),
+    prevLowWick(NO_PLOT_VALUE),
+    prevMeanWick(NO_PLOT_VALUE),
+
+    // Loop variables for optimization
+    fastLoop(0),
+    slowLoop(0),
+    iLoop(0),
+    maxBarsToScanForOpt(0),
+    whipsawCount(0),
+    lastCrossoverBarIndexInScan(0), 
+    bLastCrossAboveInScan(false),
+    smaFastI(0), smaSlowI(0),
+    smaFastPrev(0), smaSlowPrev(0),
+    bCrossUpInScan(false), bCrossDownInScan(false),
+
+    // Colors (RGB values for Pine approximates where needed)
+    colorTeal(RGB(0,128,128)),       // Opaque Teal
+    colorMaroon(RGB(128,0,0)),     // Opaque Maroon
+    colorLime(Color.LimeGreen),
+    colorRed(Color.Red),
+    colorGray(Color.Gray),
+    colorSilver(Color.Silver),
+
+    // Fill plot helper
+    fillPlotValue(NO_PLOT_VALUE),
+    fillPlotColor(Color.Transparent),
+    
+    // Shape Plotting Offset
+    priceOffsetForShape(0);
+
+
+// ========== ONE-TIME WHIPSAW OPTIMIZATION ==========
+// This block runs only once, on the 101st bar (Pine's bar_index 100)
+If CurrentBar = 101 and onceWhipsawCalcDone = false Then Begin 
+    onceWhipsawCalcDone = true; 
+    
+    maxBarsToScanForOpt = MinList(CurrentBar -1, MaxLookback); 
+
+    For fastLoop = 8 To 20 Begin
+        For slowLoop = fastLoop + 1 To 21 Begin
+            whipsawCount = 0;
+            lastCrossoverBarIndexInScan = 0; 
+            bLastCrossAboveInScan = false;
+
+            For iLoop = 1 To maxBarsToScanForOpt - WhipsawWindow Begin
+                smaFastI = Average(Close[iLoop], fastLoop);
+                smaSlowI = Average(Close[iLoop], slowLoop);
+                smaFastPrev = Average(Close[iLoop + 1], fastLoop);
+                smaSlowPrev = Average(Close[iLoop + 1], slowLoop);
+
+                bCrossUpInScan = smaFastPrev < smaSlowPrev and smaFastI > smaSlowI;
+                bCrossDownInScan = smaFastPrev > smaSlowPrev and smaFastI < smaSlowI;
+
+                If bCrossUpInScan or bCrossDownInScan Then Begin
+                    If lastCrossoverBarIndexInScan <> 0 and iLoop - lastCrossoverBarIndexInScan <= WhipsawWindow Then Begin
+                        If (bCrossUpInScan and not bLastCrossAboveInScan) or (bCrossDownInScan and bLastCrossAboveInScan) Then Begin
+                            whipsawCount = whipsawCount + 1;
+                        End;
+                    End;
+                    lastCrossoverBarIndexInScan = iLoop; 
+                    bLastCrossAboveInScan = bCrossUpInScan;
+                End;
+            End; 
+
+            If whipsawCount < MinWhipsaws Then Begin
+                MinWhipsaws = whipsawCount;
+                BestFast = fastLoop;
+                BestSlow = slowLoop;
+            End;
+        End; 
+    End; 
+    
+    Print(DateToString(Date), " ", TimeToString(Time), " Whipsaw Opt: BestFast=", BestFast, ", BestSlow=", BestSlow, ", MinWhipsaws=", MinWhipsaws);
+End;
+
+
+// ========== PER-BAR CALCULATIONS ==========
+If CurrentBar > 1 Then Begin 
+    If BestFast > 0 Then SMA1 = Average(Close, BestFast) Else SMA1 = NO_PLOT_VALUE;
+    If BestSlow > 0 Then SMA2 = Average(Close, BestSlow) Else SMA2 = NO_PLOT_VALUE;
+
+    If SMA1 <> NO_PLOT_VALUE and SMA2 <> NO_PLOT_VALUE Then
+        AverageSMA = (SMA1 + SMA2) / 2
+    Else
+        AverageSMA = NO_PLOT_VALUE;
+
+    ema20 = XAverage(Close, 20);
+
+    AtrVal = AvgTrueRange(14);
+    StopLossDistance = StopLossATRMultiplier * AtrVal;
+    TakeProfitDistance = StopLossDistance * RiskRewardRatio;
+    priceOffsetForShape = AtrVal * 0.25; // For positioning plot shapes
+
+    rsiVal = RSI(Close, RSILength);
+
+    If TimeframeHigherSymbolActive and BarType of Data2 > 0 Then Begin 
+        htfRsiValue = RSI(Close of Data2, RSILength); 
+    End Else Begin
+        htfRsiValue = rsiVal; 
+    End;
+
+    If Highest(rsiVal, StochLength) - Lowest(rsiVal, StochLength) > 0 then 
+        rawStochRSI = 100 * (rsiVal - Lowest(rsiVal, StochLength)) / (Highest(rsiVal, StochLength) - Lowest(rsiVal, StochLength))
+    else 
+        rawStochRSI = 50; // Default if RSI is flat
+
+    kVal = Average(rawStochRSI, 3); 
+    dVal = Average(kVal, 3);       
+
+    htfRsiBullish = (not TimeframeHigherSymbolActive) or htfRsiValue > 50;
+    htfRsiBearish = (not TimeframeHigherSymbolActive) or htfRsiValue < 50;
+
+    isBullish = rsiVal > rsiVal[1] and kVal > dVal and htfRsiBullish;
+    isBearish = rsiVal < rsiVal[1] and kVal < dVal and htfRsiBearish;
+
+    buyCond = Close Crosses Over Open and Low < Open and isBullish;
+    sellCond = Close Crosses Under Open and High > Open and isBearish;
+
+    Variable: lastLatestBuyAverage(NO_PLOT_VALUE), lastLatestSellAverage(NO_PLOT_VALUE);
+    lastLatestBuyAverage = latestBuyAverage;
+    lastLatestSellAverage = latestSellAverage;
+
+    If buyCond Then Begin
+        latestBuyAverage = Close;
+        buySL = latestBuyAverage - StopLossDistance;
+        buyTP = latestBuyAverage + TakeProfitDistance;
+        latestSellAverage = NO_PLOT_VALUE; 
+        sellSL = NO_PLOT_VALUE;
+        sellTP = NO_PLOT_VALUE;
+    End;
+
+    If sellCond Then Begin
+        latestSellAverage = Close;
+        sellSL = latestSellAverage + StopLossDistance; 
+        sellTP = latestSellAverage - TakeProfitDistance;
+        latestBuyAverage = NO_PLOT_VALUE; 
+        buySL = NO_PLOT_VALUE;
+        buyTP = NO_PLOT_VALUE;
+    End;
+
+    buyChanged = (latestBuyAverage <> NO_PLOT_VALUE and latestBuyAverage <> lastLatestBuyAverage);
+    sellChanged = (latestSellAverage <> NO_PLOT_VALUE and latestSellAverage <> lastLatestSellAverage);
+    
+    If latestBuyAverage <> NO_PLOT_VALUE Then Begin
+        plotBuySL = buySL;
+        plotBuyTP = buyTP;
+    End Else Begin
+        plotBuySL = NO_PLOT_VALUE;
+        plotBuyTP = NO_PLOT_VALUE;
+    End;
+
+    If latestSellAverage <> NO_PLOT_VALUE Then Begin
+        plotSellSL = sellSL;
+        plotSellTP = sellTP;
+    End Else Begin
+        plotSellSL = NO_PLOT_VALUE;
+        plotSellTP = NO_PLOT_VALUE;
+    End;
+
+    If ShowWickAnalysis Then Begin
+        prevHighWick = High[1];
+        prevLowWick = Low[1];
+        prevMeanWick = (prevHighWick + prevLowWick) / 2;
+    End Else Begin
+        prevHighWick = NO_PLOT_VALUE;
+        prevLowWick = NO_PLOT_VALUE;
+        prevMeanWick = NO_PLOT_VALUE;
+    End;
+
+    If latestBuyAverage <> NO_PLOT_VALUE Then
+        fillPlotValue = latestBuyAverage
+    Else If latestSellAverage <> NO_PLOT_VALUE Then
+        fillPlotValue = latestSellAverage
+    Else
+        fillPlotValue = NO_PLOT_VALUE;
+
+    If isBullish Then
+        fillPlotColor = colorLime
+    Else If isBearish Then
+        fillPlotColor = colorRed
+    Else
+        fillPlotColor = colorGray;
+        
+    If buyCond Then
+        Alert("Sniper Buy: " + GetSymbolName + " @ " + NumToStr(Close, NumToStrCount(MinMove / PriceScale,0)));
+    If sellCond Then
+        Alert("Sniper Sell: " + GetSymbolName + " @ " + NumToStr(Close, NumToStrCount(MinMove / PriceScale,0)));
+End; 
+
+
+// ========== PLOTTING ==========
+Plot1(AverageSMA, "AvgSMA_Trend", Color.Gray, Default, 2); 
+SetPlotStyle(1, 1); // 1 = styleHistogram (columns)
+If AverageSMA <> NO_PLOT_VALUE And AverageSMA[1] <> NO_PLOT_VALUE Then Begin
+    If AverageSMA > AverageSMA[1] Then
+        SetPlotColor(1, colorTeal)
+    Else If AverageSMA < AverageSMA[1] Then 
+        SetPlotColor(1, colorMaroon);
+End;
+
+Plot2(ema20, "EMA20", Color.Gray, Default, 3); 
+SetPlotStyle(2, 7); // 7 = styleArea
+If Close > ema20 Then
+    SetPlotColor(2, colorTeal)
+Else If Close < ema20 Then
+    SetPlotColor(2, colorMaroon);
+
+Plot3(latestBuyAverage, "LatestBuy", Iff(buyChanged, colorLime, Color.DarkGray), Default, 2);
+Plot4(latestSellAverage, "LatestSell", Iff(sellChanged, colorRed, Color.DarkGray), Default, 2);
+
+Plot5(plotBuySL, "BuySL", colorMaroon, Default, 1); SetPlotStyle(5, 2); // Dashed
+Plot6(plotBuyTP, "BuyTP", Color.DarkGreen, Default, 1); SetPlotStyle(6, 2); // Dashed
+Plot7(plotSellSL, "SellSL", colorMaroon, Default, 1); SetPlotStyle(7, 2); // Dashed
+Plot8(plotSellTP, "SellTP", Color.DarkGreen, Default, 1); SetPlotStyle(8, 2); // Dashed
+
+If buyCond Then
+    Plot9(High + priceOffsetForShape, "BuyShape", colorLime, Default, 2) 
+Else
+    Plot9(NO_PLOT_VALUE); 
+SetPlotStyle(9, 3); // 3 = StyleTriangleUp 
+
+If sellCond Then
+    Plot10(Low - priceOffsetForShape, "SellShape", colorRed, Default, 2) 
+Else
+    Plot10(NO_PLOT_VALUE);
+SetPlotStyle(10, 4); // 4 = StyleTriangleDown 
+
+Plot11(fillPlotValue, "SignalFill", fillPlotColor, Default, 1);
+SetPlotStyle(11, 1); // styleHistogram
+
+If ShowWickAnalysis Then Begin
+    Plot12(prevHighWick, "PrevTopWick", colorRed, Default, 1); SetPlotStyle(12, 5); // 5 = styleCircle
+    Plot13(prevLowWick, "PrevBottomWick", Color.DarkGreen, Default, 1); SetPlotStyle(13, 5); // styleCircle
+    Plot14(prevMeanWick, "PrevMeanWick", colorSilver, Default, 1); SetPlotStyle(14, 6); // 6 = styleCross
+End Else Begin // Ensure plots are cleared if not shown
+    Plot12(NO_PLOT_VALUE); Plot13(NO_PLOT_VALUE); Plot14(NO_PLOT_VALUE);
+End;
+
+// -- to God be the Glory
