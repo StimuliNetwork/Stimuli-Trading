@@ -1,0 +1,163 @@
+// Function: CalculateCoreSignals
+// Description: Encapsulates common per-bar calculations for generating trading signals and indicators.
+//              This function calculates SMAs, EMA, ATR, RSI, StochRSI, and bullish/bearish conditions.
+// Inputs:
+//   iBestFast (NumericSimple)        - Optimal fast SMA length (from optimization).
+//   iBestSlow (NumericSimple)        - Optimal slow SMA length (from optimization).
+//   iRSILength (NumericSimple)       - Length for RSI calculation.
+//   iStochLength (NumericSimple)     - Length for StochRSI calculation (Highest/Lowest lookup for RSI).
+//   iEMA20Length (NumericSimple)     - Length for the EMA calculation.
+//   iAtrLength (NumericSimple)       - Length for ATR calculation.
+//   iStochKSmooth (NumericSimple)    - Smoothing period for StochRSI %K.
+//   iStochDSmooth (NumericSimple)    - Smoothing period for StochRSI %D.
+//   iTimeframeHigherSymbolActive (LogicalSimple) - Flag to use higher timeframe RSI (from Data2).
+//   iCloseOfData2 (NumericSeries)    - Close prices of Data2 (for HTF RSI). Should be valid if HTF active.
+//   iRSIHighValue (NumericSimple)    - RSI upper threshold (informational, currently not used for core logic, but available).
+//   iRSILowValue (NumericSimple)     - RSI lower threshold (informational, currently not used for core logic, but available).
+//   DataSeriesClose (NumericSeries)  - Close prices of the primary data series (e.g., Close of Data1).
+//   DataSeriesHigh (NumericSeries)   - High prices of the primary data series.
+//   DataSeriesLow (NumericSeries)    - Low prices of the primary data series.
+//   DataSeriesOpen (NumericSeries)   - Open prices of the primary data series.
+//   iNO_PLOT_VALUE (NumericSimple)   - A specific unlikely value representing "no plot" or "na".
+// Outputs (by reference):
+//   oSMA1 (NumericRef)        - Calculated fast SMA.
+//   oSMA2 (NumericRef)        - Calculated slow SMA.
+//   oAverageSMA (NumericRef)  - Average of oSMA1 and oSMA2.
+//   oEMA (NumericRef)         - Calculated Exponential Moving Average.
+//   oAtrVal (NumericRef)      - Average True Range value.
+//   oRSIVal (NumericRef)      - RSI value for the primary data series.
+//   oKVal (NumericRef)        - StochRSI %K value.
+//   oDVal (NumericRef)        - StochRSI %D value.
+//   oHTFRSIVal (NumericRef)   - Higher timeframe RSI value (or primary RSI if HTF not active/valid).
+//   oIsBullish (LogicalRef)   - Overall bullish condition flag.
+//   oIsBearish (LogicalRef)   - Overall bearish condition flag.
+//   oBuyCond (LogicalRef)     - Buy signal condition flag.
+//   oSellCond (LogicalRef)    - Sell signal condition flag.
+
+Function CalculateCoreSignals(
+    // SMA parameters
+    NumericSimple iBestFast, NumericSimple iBestSlow,
+    // RSI & StochRSI parameters
+    NumericSimple iRSILength, NumericSimple iStochLength,
+    NumericSimple iStochKSmooth, NumericSimple iStochDSmooth,
+    // EMA & ATR parameters
+    NumericSimple iEMA20Length, NumericSimple iAtrLength,  // Corrected name from oEMA20 to iEMA20Length
+    // Higher Timeframe (HTF) RSI parameters
+    LogicalSimple iTimeframeHigherSymbolActive, NumericSeries iCloseOfData2,
+    // Informational RSI thresholds (currently not used in core logic here, but passed for completeness)
+    NumericSimple iRSIHighValue, NumericSimple iRSILowValue,
+    // Data series inputs
+    NumericSeries DataSeriesClose, NumericSeries DataSeriesHigh, NumericSeries DataSeriesLow, NumericSeries DataSeriesOpen,
+    // Constants
+    NumericSimple iNO_PLOT_VALUE, NumericSimple iRSI_NEUTRAL_VALUE, // Added iRSI_NEUTRAL_VALUE
+    // Output parameters (passed by reference)
+    NumericRef oSMA1, NumericRef oSMA2, NumericRef oAverageSMA, NumericRef oEMA, // Corrected oEMA20 to oEMA
+    NumericRef oAtrVal, NumericRef oRSIVal, NumericRef oKVal, NumericRef oDVal, NumericRef oHTFRSIVal,
+    LogicalRef oIsBullish, LogicalRef oIsBearish, LogicalRef oBuyCond, LogicalRef oSellCond
+)
+
+Variables:
+    // Internal variables for calculations to avoid direct modification of outputs until final assignment (good practice)
+    tempRawStochRSI(0),
+    tempRSIVal(0),
+    tempRSIValPrev(0),
+    tempKVal(0),
+    tempDVal(0),
+    tempHTFRSIValue(0),
+    // Internal boolean conditions for clarity
+    condHtfRsiIsBullish(false),
+    condHtfRsiIsBearish(false);
+
+Begin
+    // --- Moving Average Calculations ---
+    If iBestFast > 0 Then
+        oSMA1 = Average(DataSeriesClose, iBestFast)
+    Else
+        oSMA1 = iNO_PLOT_VALUE;
+
+    If iBestSlow > 0 Then
+        oSMA2 = Average(DataSeriesClose, iBestSlow)
+    Else
+        oSMA2 = iNO_PLOT_VALUE;
+
+    If oSMA1 <> iNO_PLOT_VALUE and oSMA2 <> iNO_PLOT_VALUE Then
+        oAverageSMA = (oSMA1 + oSMA2) / 2
+    Else
+        oAverageSMA = iNO_PLOT_VALUE;
+
+    // Calculate Exponential Moving Average (EMA) using the provided length.
+    If iEMA20Length > 0 Then // Corrected name from oEMA20 to iEMA20Length
+        oEMA = XAverage(DataSeriesClose, iEMA20Length) // Corrected name from oEMA20 to oEMA
+    Else
+        oEMA = iNO_PLOT_VALUE; // Corrected name from oEMA20 to oEMA
+
+    // --- Volatility Calculation (ATR) ---
+    If iAtrLength > 0 Then
+        oAtrVal = AvgTrueRange(iAtrLength)
+    Else
+        oAtrVal = 0; // Default to 0 if length is invalid
+
+    // --- RSI Calculation ---
+    If iRSILength > 0 Then Begin
+        tempRSIVal = RSI(DataSeriesClose, iRSILength);
+        tempRSIValPrev = RSI(DataSeriesClose, iRSILength)[1]; // RSI value of the previous bar.
+    End Else Begin
+        tempRSIVal = iRSI_NEUTRAL_VALUE; // Default to neutral if length is invalid.
+        tempRSIValPrev = iRSI_NEUTRAL_VALUE;
+    End;
+    oRSIVal = tempRSIVal;
+
+    // --- Higher Timeframe (HTF) RSI Calculation ---
+    If iTimeframeHigherSymbolActive and BarType of Data2 > 0 and iRSILength > 0 Then Begin
+        tempHTFRSIValue = RSI(iCloseOfData2, iRSILength);
+    End Else Begin
+        tempHTFRSIValue = tempRSIVal; // Default to current timeframe RSI if HTF is not active or invalid.
+    End;
+    oHTFRSIVal = tempHTFRSIValue;
+
+    // --- Stochastic RSI Calculation ---
+    Variable: stochHigh(0), stochLow(0), rsiRange(0); // Renamed 'range' to 'rsiRange' for clarity
+    If iStochLength > 0 and iRSILength > 0 then begin // Ensure RSI has been calculated
+        stochHigh = Highest(tempRSIVal, iStochLength);    // Highest RSI value over StochLength
+        stochLow = Lowest(tempRSIVal, iStochLength);     // Lowest RSI value over StochLength
+        rsiRange = stochHigh - stochLow;
+
+        If rsiRange > 0 Then
+            tempRawStochRSI = 100 * (tempRSIVal - stochLow) / rsiRange
+        Else
+            tempRawStochRSI = iRSI_NEUTRAL_VALUE; // Default to neutral if RSI is flat over StochLength.
+    end else begin
+        tempRawStochRSI = iRSI_NEUTRAL_VALUE; // Default if lengths are invalid.
+    end;
+
+    // Smooth Raw StochRSI to get %K and %D lines.
+    If iStochKSmooth > 0 then
+        tempKVal = Average(tempRawStochRSI, iStochKSmooth)
+    Else
+        tempKVal = tempRawStochRSI; // No smoothing if period is 0 or less.
+
+    If iStochDSmooth > 0 then
+        tempDVal = Average(tempKVal, iStochDSmooth)
+    Else
+        tempDVal = tempKVal; // No smoothing if period is 0 or less.
+
+    oKVal = tempKVal;
+    oDVal = tempDVal;
+
+    // --- Condition Generation ---
+    // Higher Timeframe RSI condition: Bullish if above neutral, Bearish if below.
+    condHtfRsiIsBullish = (not iTimeframeHigherSymbolActive) or tempHTFRSIValue > iRSI_NEUTRAL_VALUE;
+    condHtfRsiIsBearish = (not iTimeframeHigherSymbolActive) or tempHTFRSIValue < iRSI_NEUTRAL_VALUE;
+
+    // Overall Bullish/Bearish conditions:
+    // Bullish: RSI rising, Stoch %K above %D, and HTF RSI condition met.
+    oIsBullish = tempRSIVal > tempRSIValPrev and tempKVal > tempDVal and condHtfRsiIsBullish;
+    // Bearish: RSI falling, Stoch %K below %D, and HTF RSI condition met.
+    oIsBearish = tempRSIVal < tempRSIValPrev and tempKVal < tempDVal and condHtfRsiIsBearish;
+
+    // Final Buy/Sell signal conditions:
+    // Incorporates price action (candle pattern) with the overall bullish/bearish state.
+    // Using built-in CrossesOver/CrossesUnder for robust crossover detection.
+    oBuyCond = CrossesOver(DataSeriesClose, DataSeriesOpen) and DataSeriesLow < DataSeriesOpen and oIsBullish;
+    oSellCond = CrossesUnder(DataSeriesClose, DataSeriesOpen) and DataSeriesHigh > DataSeriesOpen and oIsBearish;
+End;

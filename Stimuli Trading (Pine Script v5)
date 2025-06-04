@@ -1,138 +1,241 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © StimuliNetwork
+// Last Updated: (Date of last update by developer, if known)
+// Version: (Version number, if applicable)
+// Description: This script implements the Stimuli Network trading indicator.
+// It includes a one-time SMA whipsaw optimization, RSI, StochRSI, and EMA calculations
+// to generate buy/sell signals and visual cues on the chart.
 
 //@version=5
-indicator("Stimuli Network", overlay=true)
+indicator("Stimuli Network v2", shorttitle="StimuliNet v2", overlay=true, timeframe="")
 
-whipsaw_window = 5
-max_lookback = 5000
+// ============== Constants ==============
+// --- Optimization Parameters ---
+// These constants define the search space for the SMA whipsaw optimization.
+int MIN_FAST_MA_OPT = 8 // Minimum Fast MA length for optimization scan.
+int MAX_FAST_MA_OPT = 20 // Maximum Fast MA length for optimization scan.
+int MAX_SLOW_MA_OPT = 21 // Maximum Slow MA length for optimization scan. (Slow MA > Fast MA)
+int MIN_BARS_FOR_OPTIMIZATION = 100 // Minimum number of bars on chart (1-based index) for optimization to run.
+                                    // Corresponds to bar_index = 99 for 0-indexed Pine.
+                                    // The logic will run when current bar_index is MIN_BARS_FOR_OPTIMIZATION (i.e., 101st bar, index 100).
 
-var int best_fast = na
-var int best_slow = na
-var int min_whipsaws = 100000
+// --- RSI Constants ---
+float RSI_NEUTRAL_VALUE = 50.0 // Standard neutral value for RSI.
 
-if bar_index == 100
-    int max_bars_to_scan = math.min(bar_index, max_lookback)
-    for fast = 8 to 20
-        for slow = fast + 1 to 21
-            int whipsaw_count = 0
-            int last_crossover_bar = na
-            bool last_cross_above = false
-            for i = 1 to max_bars_to_scan - whipsaw_window
-                float sma_fast_i = ta.sma(close[i], fast)
-                float sma_slow_i = ta.sma(close[i], slow)
-                float sma_fast_prev = ta.sma(close[i + 1], fast)
-                float sma_slow_prev = ta.sma(close[i + 1], slow)
-                bool cross_up = sma_fast_prev < sma_slow_prev and sma_fast_i > sma_slow_i
-                bool cross_down = sma_fast_prev > sma_slow_prev and sma_fast_i < sma_slow_i
-                if cross_up or cross_down
-                    if last_crossover_bar != na and i - last_crossover_bar <= whipsaw_window
-                        if cross_up != last_cross_above
-                            whipsaw_count += 1
-                    last_crossover_bar := i
-                    last_cross_above := cross_up
-            if whipsaw_count < min_whipsaws
-                min_whipsaws := whipsaw_count
-                best_fast := fast
-                best_slow := slow
+// ============== Script Inputs ==============
 
-sma1 = not na(best_fast) ? ta.sma(close, best_fast) : na
-sma2 = not na(best_slow) ? ta.sma(close, best_slow) : na
-average_sma = (sma1 + sma2) / 2
-plot(average_sma, color=color.new(average_sma > average_sma[1] ? color.teal : color.maroon, 50), linewidth=1, style=plot.style_columns)
+// --- General Settings Group ---
+string GRP_GENERAL = "General Settings"
+riskRewardRatio = input.float(2.0, title="Risk-Reward Ratio", group=GRP_GENERAL, tooltip="Target profit relative to stop loss distance.")
+stopLossATRMultiplier = input.float(1.5, title="Stop Loss ATR Multiplier", group=GRP_GENERAL, tooltip="Multiplier for ATR to determine stop loss distance.")
+timeframeHigher = input.timeframe("", title="Higher Timeframe (Optional)", group=GRP_GENERAL, tooltip="Select a higher timeframe for RSI analysis. Leave blank to use chart timeframe.")
+emaLength = input.int(20, title="EMA Length", group=GRP_GENERAL, minval=1, tooltip="Length for the Exponential Moving Average.")
+atrLength = input.int(14, title="ATR Length", group=GRP_GENERAL, minval=1, tooltip="Length for the Average True Range calculation.")
 
-plot(ta.ema(close, 20), color=color.new(close > ta.ema(close, 20) ? color.teal : color.maroon, 65), linewidth=3, style=plot.style_area)
+// --- Whipsaw Optimization Settings Group ---
+string GRP_WHIPSAW = "Whipsaw Optimization Settings"
+whipsaw_window_opt = input.int(5, title="Whipsaw Window", group=GRP_WHIPSAW, minval=1, tooltip="Number of bars within which opposing crossovers are counted as a whipsaw during optimization.")
+max_lookback_opt = input.int(5000, title="Max Lookback Bars", group=GRP_WHIPSAW, minval=1, tooltip="Maximum historical bars to scan for optimization.")
 
-riskRewardRatio = input.float(2.0, title="Risk-Reward Ratio", group="General Settings")
-stopLossATRMultiplier = input.float(1.5, title="Stop Loss ATR Multiplier", group="General Settings")
-timeframeHigher = input.timeframe("", title="Higher Timeframe", group="General Settings")
+// --- RSI Settings Group ---
+string GRP_RSI = "RSI Settings"
+rsiLength = input.int(14, title="RSI Length", group=GRP_RSI, minval=1)
+rsiSource = input.source(close, title="RSI Source", group=GRP_RSI)
+rsiHighValue = input.int(75, title="RSI Upper Threshold (Info)", group=GRP_RSI, tooltip="Informational: RSI value considered high.")
+rsiLowValue = input.int(25, title="RSI Lower Threshold (Info)", group=GRP_RSI, tooltip="Informational: RSI value considered low.")
 
-atr_val = ta.atr(14)
-stopLossDistance = stopLossATRMultiplier * atr_val
-takeProfitDistance = stopLossDistance * riskRewardRatio
+// --- Stochastic RSI Settings Group ---
+string GRP_STOCH_RSI = "Stochastic RSI Settings"
+stochLength = input.int(14, title="Stochastic Length", group=GRP_STOCH_RSI, minval=1, tooltip="Lookback period for finding Highest/Lowest RSI in StochRSI.")
+stochKSmooth = input.int(3, title="Stoch %K Smooth", group=GRP_STOCH_RSI, minval=1, tooltip="Smoothing period for StochRSI %K line.")
+stochDSmooth = input.int(3, title="Stoch %D Smooth", group=GRP_STOCH_RSI, minval=1, tooltip="Smoothing period for StochRSI %D line.")
 
-rsiLength = input.int(14, minval=1, title="RSI Length", group="RSI Settings")
-rsiSource = input.source(close, title="Source", group="RSI Settings")
-rsiHighValue = input.int(75, title="RSI Upper Threshold", group="RSI Settings")
-rsiLowValue = input.int(25, title="RSI Lower Threshold", group="RSI Settings")
+// --- Display Settings Group ---
+string GRP_DISPLAY = "Display Settings"
+showWickAnalysis = input.bool(false, "Show Previous Wick Analysis", group=GRP_DISPLAY, tooltip="Toggles display of previous bar's high/low/mean wick markers.")
 
-rsi = ta.rsi(rsiSource, rsiLength)
-htf_rsi_value = timeframeHigher != "" ? request.security(syminfo.tickerid, timeframeHigher, ta.rsi(rsiSource, rsiLength)) : rsi
+// ============== Variable Declarations ==============
+// --- Optimization Variables ---
+var int best_fast_sma = na // Stores the best fast SMA length found by optimization.
+var int best_slow_sma = na // Stores the best slow SMA length found.
+var int min_whipsaws_found = 100000 // Stores the minimum whipsaw count. Initialized high for minimization.
 
-stochLength = input.int(14, title="Stochastic Length", group="Stochastic RSI Settings")
-k_val = ta.sma(ta.stoch(rsi, rsi, rsi, stochLength), 3)
-d_val = ta.sma(k_val, 3)
+// --- Indicator Value Variables ---
+float sma1 = na, float sma2 = na, float average_sma = na, float ema_value = na, float atr_val = na
+float rsi_value = na, float htf_rsi_value = na, float k_val = na, float d_val = na
+bool isBullishCondition = false, bool isBearishCondition = false
+bool buySignal = false, bool sellSignal = false
+float stopLossDist = na, float takeProfitDist = na
 
-htfRsiBullish = timeframeHigher == "" or htf_rsi_value > 50
-htfRsiBearish = timeframeHigher == "" or htf_rsi_value < 50
+// --- Plotting Helper Variables ---
+var float latestBuyAvgPrice = na, var float latestSellAvgPrice = na
+var float buyStopLossLevel = na, var float buyTakeProfitLevel = na
+var float sellStopLossLevel = na, var float sellTakeProfitLevel = na
 
-isBullish = rsi > rsi[1] and k_val > d_val and htfRsiBullish
-isBearish = rsi < rsi[1] and k_val < d_val and htfRsiBearish
+// ============== One-Time Whipsaw Optimization ==============
+// This block runs once when bar_index reaches MIN_BARS_FOR_OPTIMIZATION (e.g., 100, meaning the 101st bar).
+if bar_index == MIN_BARS_FOR_OPTIMIZATION
+    // Determine the number of historical bars to scan. bar_index itself represents the count of available historical bars (0 to bar_index-1).
+    // So, if bar_index is 100, there are 100 historical bars available (indices 0 to 99).
+    // The loop for 'i' goes from 1 up to 'max_bars_to_scan - ...', accessing close[i].
+    // close[1] is previous bar, close[bar_index] is the earliest bar.
+    int num_available_historical_bars = bar_index
+    int max_bars_to_scan = math.min(num_available_historical_bars, max_lookback_opt)
 
-buyCondition = ta.crossover(close, open) and low < open and isBullish
-sellCondition = ta.crossunder(close, open) and high > open and isBearish
+    // Log info if MaxLookback input was limited by available data.
+    if max_lookback_opt > max_bars_to_scan and num_available_historical_bars < max_lookback_opt
+        log.warning("Whipsaw Opt Info: Scan range (" + str.tostring(max_bars_to_scan) + " bars) is limited by available data (" + str.tostring(num_available_historical_bars) + "), less than MaxLookback input (" + str.tostring(max_lookback_opt) + ").")
 
-var float latestBuyAverage = na
-var float latestSellAverage = na
-var float buySL = na
-var float buyTP = na
-var float sellSL = na
-var float sellTP = na
+    // Check for sufficient data for a meaningful scan.
+    if max_bars_to_scan < whipsaw_window_opt + MAX_SLOW_MA_OPT + 1
+        log.warning("Whipsaw Opt Warning: Not enough data for full optimization. Scannable bars=" + str.tostring(max_bars_to_scan) +
+                  ", Required approx. " + str.tostring(whipsaw_window_opt + MAX_SLOW_MA_OPT + 1) + " historical bars.")
+    else
+        // Loop through potential Fast SMA lengths.
+        for fast_ma = MIN_FAST_MA_OPT to MAX_FAST_MA_OPT
+            // Loop through potential Slow SMA lengths (must be greater than Fast MA).
+            for slow_ma = fast_ma + 1 to MAX_SLOW_MA_OPT
+                int current_whipsaw_count = 0
+                int last_crossover_bar_offset = na // 'i' is offset from current bar (1 = prev bar)
+                bool last_cross_was_up = false
 
-if buyCondition
-    latestBuyAverage := close
-    buySL := latestBuyAverage - stopLossDistance
-    buyTP := latestBuyAverage + takeProfitDistance
-    latestSellAverage := na
-    sellSL := na
-    sellTP := na
-if sellCondition
-    latestSellAverage := close
-    sellSL := latestSellAverage + stopLossDistance
-    sellTP := latestSellAverage - takeProfitDistance
-    latestBuyAverage := na
-    buySL := na
-    buyTP := na
+                // Iterate through historical bars (offsets 'i') to count whipsaws.
+                // Max value for 'i' must ensure sma_slow_prev (using close[i+1+slow_ma-1]) is valid.
+                // Max 'i' should be max_bars_to_scan - (slow_ma -1) - 1 for sma_slow_prev.
+                // And also consider whipsaw_window_opt.
+                // Loop from i=1 (previous bar) up to a limit.
+                for i = 1 to max_bars_to_scan - whipsaw_window_opt - slow_ma // Adjusted loop boundary
+                    if i + 1 + slow_ma > max_bars_to_scan // Defensive check
+                        break
 
-buyChanged = ta.change(latestBuyAverage)
-sellChanged = ta.change(latestSellAverage)
+                    float sma_fast_i = ta.sma(close[i], fast_ma)
+                    float sma_slow_i = ta.sma(close[i], slow_ma)
+                    float sma_fast_prev = ta.sma(close[i + 1], fast_ma)
+                    float sma_slow_prev = ta.sma(close[i + 1], slow_ma)
 
-buyColor = buyChanged ? color.lime : color.new(color.lime, 0)
-sellColor = sellChanged ? color.red : color.new(color.red, 0)
+                    bool crossed_up = sma_fast_prev < sma_slow_prev and sma_fast_i > sma_slow_i
+                    bool crossed_down = sma_fast_prev > sma_slow_prev and sma_fast_i < sma_slow_i
 
-buyPlot = plot(not na(latestBuyAverage) ? latestBuyAverage : na, title="Latest Buy", color=buyColor, linewidth=2)
-sellPlot = plot(not na(latestSellAverage) ? latestSellAverage : na, title="Latest Sell", color=sellColor, linewidth=2)
+                    if crossed_up or crossed_down
+                        if not na(last_crossover_bar_offset) and i - last_crossover_bar_offset <= whipsaw_window_opt // Pine's 'i' is like EL's displacement, smaller 'i' is more recent
+                            if crossed_up != last_cross_was_up
+                                current_whipsaw_count += 1
 
-plot(not na(buySL) ? buySL : na, title="Buy SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
-plot(not na(buyTP) ? buyTP : na, title="Buy TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
-plot(not na(sellSL) ? sellSL : na, title="Sell SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1)
-plot(not na(sellTP) ? sellTP : na, title="Sell TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+                        last_crossover_bar_offset := i
+                        last_cross_was_up := crossed_up
 
-if (not na(latestBuyAverage))
-    line.new(x1=bar_index, x2=bar_index, y1=low, y2=high, width=1, color=buyColor, style=line.style_dotted)
+                if current_whipsaw_count < min_whipsaws_found
+                    min_whipsaws_found := current_whipsaw_count
+                    best_fast_sma := fast_ma
+                    best_slow_sma := slow_ma
 
-if (not na(latestSellAverage))
-    line.new(x1=bar_index, x2=bar_index, y1=low, y2=high, width=1, color=sellColor, style=line.style_dotted)
+        if na(best_fast_sma) or na(best_slow_sma)
+            log.warning("Whipsaw Opt Results: Opt. did not find a valid SMA pair. MinWhipsaws recorded: " + str.tostring(min_whipsaws_found) +
+                      ". Consider adjusting parameters or checking data. Scanned " + str.tostring(max_bars_to_scan) + " bars.")
+        else
+            log.info("Whipsaw Opt Results: BestFast={0}, BestSlow={1}, MinWhipsaws={2}. Scanned {3} bars.",
+                  best_fast_sma, best_slow_sma, min_whipsaws_found, max_bars_to_scan)
 
 
-plotshape(buyCondition, title="Buy", location=location.abovebar, color=color.new(color.lime, 0), style=shape.triangleup, size=size.tiny)
-plotshape(sellCondition, title="Sell", location=location.belowbar, color=color.new(color.red, 0), style=shape.triangledown, size=size.tiny)
+// ============== Per-Bar Calculations ==============
+// Calculate indicator values on each bar.
 
-fill(buyPlot, sellPlot, color=color.new(isBullish ? color.lime : isBearish ? color.red : color.gray, 0))
+// --- SMAs (using optimized lengths if available) ---
+if not na(best_fast_sma)
+    sma1 := ta.sma(close, best_fast_sma)
+if not na(best_slow_sma)
+    sma2 := ta.sma(close, best_slow_sma)
 
-showWickAnalysis = input.bool(false, "Show Previous Wick Analysis", group="Display Settings")
+if not na(sma1) and not na(sma2)
+    average_sma := (sma1 + sma2) / 2
 
-prevHighWick = high[1]
-prevLowWick = low[1]
-prevMeanWick = (prevHighWick + prevLowWick) / 2
+// --- EMA ---
+ema_value := ta.ema(close, emaLength)
 
-plot(showWickAnalysis ? prevHighWick : na, title="Prev Top Wick", color=color.new(color.red, 80), linewidth=1, style=plot.style_circles)
-plot(showWickAnalysis ? prevLowWick : na, title="Prev Bottom Wick", color=color.new(color.green, 80), linewidth=1, style=plot.style_circles)
-plot(showWickAnalysis ? prevMeanWick : na, title="Prev Mean Wick", color=color.silver, style=plot.style_cross)
+// --- ATR (for Stop Loss and Take Profit) ---
+atr_val := ta.atr(atrLength)
+if not na(atr_val) and atr_val > 0
+    stopLossDist := stopLossATRMultiplier * atr_val
+    takeProfitDist := stopLossDist * riskRewardRatio
+else // Fallback if ATR is not available or zero
+    stopLossDist := nz((high-low) * stopLossATRMultiplier, close * 0.01 * stopLossATRMultiplier) // Ensure non-zero
+    takeProfitDist := stopLossDist * riskRewardRatio
 
-if buyCondition
+
+// --- RSI ---
+rsi_value := ta.rsi(rsiSource, rsiLength)
+
+// --- Higher Timeframe RSI ---
+htf_rsi_value := timeframeHigher != "" ? request.security(syminfo.tickerid, timeframeHigher, ta.rsi(rsiSource, rsiLength), lookahead=barmerge.lookahead_off) : rsi_value
+
+// --- Stochastic RSI ---
+float rsi_stoch = ta.stoch(rsi_value, rsi_value, rsi_value, stochLength)
+k_val := ta.sma(rsi_stoch, stochKSmooth)
+d_val := ta.sma(k_val, stochDSmooth)
+
+// --- Condition Generation ---
+bool htfRsiIsBullish = timeframeHigher == "" or htf_rsi_value > RSI_NEUTRAL_VALUE
+bool htfRsiIsBearish = timeframeHigher == "" or htf_rsi_value < RSI_NEUTRAL_VALUE
+
+isBullishCondition := rsi_value > rsi_value[1] and k_val > d_val and htfRsiIsBullish
+isBearishCondition := rsi_value < rsi_value[1] and k_val < d_val and htfRsiIsBearish
+
+buySignal := ta.crossover(close, open) and low < open and isBullishCondition
+sellSignal := ta.crossunder(close, open) and high > open and isBearishCondition
+
+
+// --- Manage Trade State & SL/TP Levels for Plotting ---
+if buySignal
+    latestBuyAvgPrice := close
+    buyStopLossLevel := latestBuyAvgPrice - stopLossDist
+    buyTakeProfitLevel := latestBuyAvgPrice + takeProfitDist
+    latestSellAvgPrice := na
+    sellStopLossLevel := na
+    sellTakeProfitLevel := na
+if sellSignal
+    latestSellAvgPrice := close
+    sellStopLossLevel := latestSellAvgPrice + stopLossDist
+    sellTakeProfitLevel := latestSellAvgPrice - takeProfitDist
+    latestBuyAvgPrice := na
+    buyStopLossLevel := na
+    buyTakeProfitLevel := na
+
+bool buyPriceChanged = ta.change(latestBuyAvgPrice)
+bool sellPriceChanged = ta.change(latestSellAvgPrice)
+
+color buySignalColor = buyPriceChanged ? color.lime : color.new(color.lime, 70)
+color sellSignalColor = sellPriceChanged ? color.red : color.new(color.red, 70)
+
+// ============== Plotting ==============
+plot(average_sma, title="Avg SMA Trend", color=color.new(average_sma > average_sma[1] ? color.teal : color.maroon, 50), style=plot.style_columns, linewidth=1)
+plot(ema_value, title="EMA", color=color.new(close > ema_value ? color.teal : color.maroon, 65), style=plot.style_area, linewidth=3)
+
+plot(latestBuyAvgPrice, title="Latest Buy Price", color=buySignalColor, linewidth=2, display=display.data_window)
+plot(latestSellAvgPrice, title="Latest Sell Price", color=sellSignalColor, linewidth=2, display=display.data_window)
+
+plot(buyStopLossLevel, title="Buy SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1, display=display.data_window)
+plot(buyTakeProfitLevel, title="Buy TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1, display=display.data_window)
+plot(sellStopLossLevel, title="Sell SL", color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=1, display=display.data_window)
+plot(sellTakeProfitLevel, title="Sell TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1, display=display.data_window)
+
+plotshape(buySignal, title="Buy Signal Shape", location=location.abovebar, color=color.new(color.lime, 0), style=shape.triangleup, size=size.tiny)
+plotshape(sellSignal, title="Sell Signal Shape", location=location.belowbar, color=color.new(color.red, 0), style=shape.triangledown, size=size.tiny)
+
+bgcolor(isBullishCondition ? color.new(color.teal, 90) : isBearishCondition ? color.new(color.maroon, 90) : na, title="Bull/Bear Background")
+
+if showWickAnalysis
+    float prevHighWick = high[1]
+    float prevLowWick = low[1]
+    float prevMeanWick = (prevHighWick + prevLowWick) / 2
+    plot(prevHighWick, title="Prev Top Wick", color=color.new(color.red, 70), style=plot.style_circles, linewidth=1)
+    plot(prevLowWick, title="Prev Bottom Wick", color=color.new(color.green, 70), style=plot.style_circles, linewidth=1)
+    plot(prevMeanWick, title="Prev Mean Wick", color=color.new(color.silver, 50), style=plot.style_cross, linewidth=1)
+
+// ============== Alerts ==============
+if buySignal
     alert("Sniper Buy: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
-if sellCondition
+if sellSignal
     alert("Sniper Sell: " + syminfo.ticker + " @ " + str.tostring(close), alert.freq_once_per_bar_close)
 
-//-- to God be the Glory
+// ============== End of Script ==============
+// -- to God be the Glory
