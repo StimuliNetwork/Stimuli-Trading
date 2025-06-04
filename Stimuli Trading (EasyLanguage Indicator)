@@ -1,228 +1,187 @@
 // EasyLanguage Conversion of Stimuli Network Indicator
+// Refactored to use OptimizeWhipsawSMA and CalculateCoreSignals functions
+// Enhanced with configurable lengths and constants.
 
 // Pine Script® original by StimuliNetwork
 // Subject to Mozilla Public License 2.0
 
-// Global constant for "no plot" values (alternative to 0 if 0 is a valid price)
-Define: NO_PLOT_VALUE (-1.2345e-10); // A very specific unlikely value for "na"
+// ============== Global Constants ==============
+Define: NO_PLOT_VALUE (-1.2345e-10); // A very specific unlikely value for "na" or "no plot".
+Define: RSI_NEUTRAL_VALUE (50);     // Standard neutral value for RSI.
+Define: MIN_BARS_FOR_OPTIMIZATION (101); // Min bars needed on chart before optimization runs (original was 101, effectively 100th index).
 
+// ============== Assumed Function Definitions ==============
+// It is assumed that OptimizeWhipsawSMA and CalculateCoreSignals functions are defined elsewhere
+// (e.g., via separate .elf files compiled with the project or pre-pended).
+// Their definitions are not repeated here for brevity but are updated as per the subtask.
+/*
+// Function OptimizeWhipsawSMA(...) - See OptimizeWhipsawSMA.elf for full code
+// Constants: MIN_FAST_MA_OPT(8), MAX_FAST_MA_OPT(20), MAX_SLOW_MA_OPT(21)
+// Function CalculateCoreSignals(...) - See CalculateCoreSignals.elf for full code
+*/
+
+// ============== Inputs ==============
 Inputs:
-    WhipsawWindow(5),
-    MaxLookback(5000), // Used for optimization scan limit
-    RiskRewardRatio(2.0),
-    StopLossATRMultiplier(1.5),
-    // For HTF RSI: To use, add a Data2 stream to your chart with the desired higher timeframe.
-    // If TimeframeHigherSymbolActive is false, current timeframe RSI is used.
-    TimeframeHigherSymbolActive(false, "Use Higher Timeframe (Data2) for RSI?"), 
-    RSILength(14),
-    // RSISource(Close), // In EL, source is often explicit (e.g. Close). Pine's input.source is flexible. Defaulting to Close.
-    RSIHighValue(75, "RSI Upper Threshold (Info)"), // For conditions, not directly plotted as levels here
-    RSILowValue(25, "RSI Lower Threshold (Info)"),  // For conditions, not directly plotted as levels here
-    StochLength(14, "Stochastic Length (for StochRSI)"),
-    ShowWickAnalysis(false, "Show Previous Wick Analysis");
+    // Whipsaw Optimization Inputs
+    WhipsawWindow(5, "Whipsaw Window (Opt.)"),                 // Window size in bars to define a whipsaw for optimization.
+    MaxLookback(5000, "Max Lookback (Opt.)"),               // Maximum historical bars to scan for whipsaw optimization.
+
+    // General Strategy Settings
+    RiskRewardRatio(2.0, "Risk/Reward Ratio"),
+    StopLossATRMultiplier(1.5, "Stop Loss ATR Multiplier"),
+
+    // RSI Settings
+    RSILength(14, "RSI Length"),
+    TimeframeHigherSymbolActive(false, "Use Higher Timeframe RSI? (Data2)"),
+    RSIHighValue(75, "RSI Upper Threshold (Info)"),         // Informational: RSI value considered high.
+    RSILowValue(25, "RSI Lower Threshold (Info)"),          // Informational: RSI value considered low.
+
+    // Stochastic RSI Settings
+    StochLength(14, "Stochastic Length (for StochRSI)"),   // Lookback period for finding Highest/Lowest RSI in StochRSI calc.
+    StochKSmooth(3, "Stoch %K Smooth"),                   // Smoothing period for StochRSI %K line.
+    StochDSmooth(3, "Stoch %D Smooth"),                   // Smoothing period for StochRSI %D line.
+
+    // Other Indicator Lengths
+    EMA20Length(20, "EMA Length"),                          // Length for the Exponential Moving Average.
+    AtrLength(14, "ATR Length"),                            // Length for Average True Range calculation.
+
+    // Display Settings
+    ShowWickAnalysis(false, "Show Previous Wick Analysis");   // Toggle for displaying previous bar's wick analysis.
 
 Variables:
-    // Whipsaw Optimization State (calculated once)
+    // --- Whipsaw Optimization State (outputs from OptimizeWhipsawSMA) ---
     BestFast(0), 
     BestSlow(0), 
-    MinWhipsaws(100000),
-    onceWhipsawCalcDone(false), // Flag for one-time calculation
+    MinWhipsaws(100000),    // Initialized high for minimization.
+    onceWhipsawCalcDone(false), // Flag for one-time optimization execution.
 
-    // SMAs from optimization
-    SMA1(NO_PLOT_VALUE),
-    SMA2(NO_PLOT_VALUE),
-    AverageSMA(NO_PLOT_VALUE),
-    ema20(0),
+    // --- Variables to hold outputs from CalculateCoreSignals ---
+    currentSMA1(NO_PLOT_VALUE), currentSMA2(NO_PLOT_VALUE), currentAverageSMA(NO_PLOT_VALUE),
+    currentEMA(0), // Renamed from currentEMA20
+    currentAtrVal(0), currentRSIVal(0), currentKVal(0), currentDVal(0),
+    currentHTFRSIVal(0), currentIsBullish(false), currentIsBearish(false),
+    currentBuyCond(false), currentSellCond(false),
 
-    // ATR and SL/TP
+    // --- Main state variables for the indicator logic & plotting ---
+    SMA1(NO_PLOT_VALUE), SMA2(NO_PLOT_VALUE), AverageSMA(NO_PLOT_VALUE),
+    emaValue(0), // Renamed from ema20 to store output from currentEMA
     AtrVal(0),
-    StopLossDistance(0),
-    TakeProfitDistance(0),
+    StopLossDistance(0), TakeProfitDistance(0),
+    rsiVal(0), htfRsiValue(0), kVal(0), dVal(0),
+    isBullish(false), isBearish(false),
+    buyCond(false), sellCond(false),
 
-    // RSI
-    rsiVal(0),
-    htfRsiValue(0), // Higher Timeframe RSI value
+    // --- Trade State & SL/TP Values for plotting (indicator doesn't trade) ---
+    latestBuyAverage(NO_PLOT_VALUE), latestSellAverage(NO_PLOT_VALUE),
+    buySL(NO_PLOT_VALUE), buyTP(NO_PLOT_VALUE),
+    sellSL(NO_PLOT_VALUE), sellTP(NO_PLOT_VALUE),
 
-    // Stochastic RSI
-    rawStochRSI(0),
-    kVal(0), // Smoothed %K of StochRSI
-    dVal(0), // Smoothed %D of StochRSI
+    // --- Plotting helpers ---
+    plotBuySL(NO_PLOT_VALUE), plotBuyTP(NO_PLOT_VALUE),
+    plotSellSL(NO_PLOT_VALUE), plotSellTP(NO_PLOT_VALUE),
+    buyChanged(false), sellChanged(false),
+    prevHighWick(NO_PLOT_VALUE), prevLowWick(NO_PLOT_VALUE), prevMeanWick(NO_PLOT_VALUE),
+    fillPlotValue(NO_PLOT_VALUE), fillPlotColor(Color.Transparent),
+    priceOffsetForShape(0),
 
-    // Conditions
-    htfRsiBullish(false),
-    htfRsiBearish(false),
-    isBullish(false),
-    isBearish(false),
-    buyCond(false),
-    sellCond(false),
-
-    // Trade State & SL/TP Values
-    latestBuyAverage(NO_PLOT_VALUE), 
-    latestSellAverage(NO_PLOT_VALUE), 
-    buySL(NO_PLOT_VALUE),
-    buyTP(NO_PLOT_VALUE),
-    sellSL(NO_PLOT_VALUE),
-    sellTP(NO_PLOT_VALUE),
-
-    // Plotting helpers for SL/TP (to handle "na" or breaks)
-    plotBuySL(NO_PLOT_VALUE),
-    plotBuyTP(NO_PLOT_VALUE),
-    plotSellSL(NO_PLOT_VALUE),
-    plotSellTP(NO_PLOT_VALUE),
-    
-    // Color calculation helpers
-    buyChanged(false),
-    sellChanged(false),
-
-    // Previous Wick Analysis
-    prevHighWick(NO_PLOT_VALUE),
-    prevLowWick(NO_PLOT_VALUE),
-    prevMeanWick(NO_PLOT_VALUE),
-
-    // Loop variables for optimization
-    fastLoop(0),
-    slowLoop(0),
-    iLoop(0),
-    maxBarsToScanForOpt(0),
-    whipsawCount(0),
-    lastCrossoverBarIndexInScan(0), 
-    bLastCrossAboveInScan(false),
-    smaFastI(0), smaSlowI(0),
-    smaFastPrev(0), smaSlowPrev(0),
-    bCrossUpInScan(false), bCrossDownInScan(false),
-
-    // Colors (RGB values for Pine approximates where needed)
-    colorTeal(RGB(0,128,128)),       // Opaque Teal
-    colorMaroon(RGB(128,0,0)),     // Opaque Maroon
-    colorLime(Color.LimeGreen),
-    colorRed(Color.Red),
-    colorGray(Color.Gray),
-    colorSilver(Color.Silver),
-
-    // Fill plot helper
-    fillPlotValue(NO_PLOT_VALUE),
-    fillPlotColor(Color.Transparent),
-    
-    // Shape Plotting Offset
-    priceOffsetForShape(0);
+    // --- Colors ---
+    colorTeal(RGB(0,128,128)), colorMaroon(RGB(128,0,0)),
+    colorLime(Color.LimeGreen), colorRed(Color.Red),
+    colorGray(Color.Gray), colorSilver(Color.Silver);
 
 
-// ========== ONE-TIME WHIPSAW OPTIMIZATION ==========
-// This block runs only once, on the 101st bar (Pine's bar_index 100)
-If CurrentBar = 101 and onceWhipsawCalcDone = false Then Begin 
+// ========== ONE-TIME WHIPSAW OPTIMIZATION CALL ==========
+// This block calls the whipsaw optimization function once, after enough bars have loaded.
+// MIN_BARS_FOR_OPTIMIZATION ensures that there's a minimum history available for the scan.
+If CurrentBar = MIN_BARS_FOR_OPTIMIZATION and onceWhipsawCalcDone = false Then Begin
+    // Call the OptimizeWhipsawSMA function to determine the best Fast and Slow SMA lengths.
+    // Outputs (BestFast, BestSlow, MinWhipsaws) are passed by reference and updated within the function.
+    OptimizeWhipsawSMA(WhipsawWindow, MaxLookback, Close, BestFast, BestSlow, MinWhipsaws);
     onceWhipsawCalcDone = true; 
-    
-    maxBarsToScanForOpt = MinList(CurrentBar -1, MaxLookback); 
-
-    For fastLoop = 8 To 20 Begin
-        For slowLoop = fastLoop + 1 To 21 Begin
-            whipsawCount = 0;
-            lastCrossoverBarIndexInScan = 0; 
-            bLastCrossAboveInScan = false;
-
-            For iLoop = 1 To maxBarsToScanForOpt - WhipsawWindow Begin
-                smaFastI = Average(Close[iLoop], fastLoop);
-                smaSlowI = Average(Close[iLoop], slowLoop);
-                smaFastPrev = Average(Close[iLoop + 1], fastLoop);
-                smaSlowPrev = Average(Close[iLoop + 1], slowLoop);
-
-                bCrossUpInScan = smaFastPrev < smaSlowPrev and smaFastI > smaSlowI;
-                bCrossDownInScan = smaFastPrev > smaSlowPrev and smaFastI < smaSlowI;
-
-                If bCrossUpInScan or bCrossDownInScan Then Begin
-                    If lastCrossoverBarIndexInScan <> 0 and iLoop - lastCrossoverBarIndexInScan <= WhipsawWindow Then Begin
-                        If (bCrossUpInScan and not bLastCrossAboveInScan) or (bCrossDownInScan and bLastCrossAboveInScan) Then Begin
-                            whipsawCount = whipsawCount + 1;
-                        End;
-                    End;
-                    lastCrossoverBarIndexInScan = iLoop; 
-                    bLastCrossAboveInScan = bCrossUpInScan;
-                End;
-            End; 
-
-            If whipsawCount < MinWhipsaws Then Begin
-                MinWhipsaws = whipsawCount;
-                BestFast = fastLoop;
-                BestSlow = slowLoop;
-            End;
-        End; 
-    End; 
-    
-    Print(DateToString(Date), " ", TimeToString(Time), " Whipsaw Opt: BestFast=", BestFast, ", BestSlow=", BestSlow, ", MinWhipsaws=", MinWhipsaws);
+    // The Print statement detailing optimization results is inside the OptimizeWhipsawSMA function.
 End;
 
 
-// ========== PER-BAR CALCULATIONS ==========
+// ========== PER-BAR CALCULATIONS & LOGIC ==========
+// This block executes on each bar after the first bar.
 If CurrentBar > 1 Then Begin 
-    If BestFast > 0 Then SMA1 = Average(Close, BestFast) Else SMA1 = NO_PLOT_VALUE;
-    If BestSlow > 0 Then SMA2 = Average(Close, BestSlow) Else SMA2 = NO_PLOT_VALUE;
+    // Call CalculateCoreSignals function to get main signal values and conditions.
+    // This function encapsulates the calculation of SMAs, EMA, ATR, RSI, StochRSI, and bullish/bearish states.
+    CalculateCoreSignals(
+        BestFast, BestSlow,                             // Optimized SMA lengths
+        RSILength, StochLength, StochKSmooth, StochDSmooth, // RSI and StochRSI parameters
+        EMA20Length, AtrLength,                         // EMA and ATR lengths
+        TimeframeHigherSymbolActive, Close of Data2,    // HTF RSI parameters
+        RSIHighValue, RSILowValue,                      // Informational RSI thresholds
+        Close, High, Low, Open,                         // Current bar data
+        NO_PLOT_VALUE, RSI_NEUTRAL_VALUE,               // Constants
+        // --- Output variables (passed by reference) ---
+        currentSMA1, currentSMA2, currentAverageSMA, currentEMA, currentAtrVal,
+        currentRSIVal, currentKVal, currentDVal, currentHTFRSIVal,
+        currentIsBullish, currentIsBearish, currentBuyCond, currentSellCond
+    );
 
-    If SMA1 <> NO_PLOT_VALUE and SMA2 <> NO_PLOT_VALUE Then
-        AverageSMA = (SMA1 + SMA2) / 2
-    Else
-        AverageSMA = NO_PLOT_VALUE;
+    // Assign outputs from CalculateCoreSignals to the indicator's main state variables.
+    SMA1 = currentSMA1;
+    SMA2 = currentSMA2;
+    AverageSMA = currentAverageSMA;
+    emaValue = currentEMA; // Store the calculated EMA value
+    AtrVal = currentAtrVal;
+    rsiVal = currentRSIVal;
+    kVal = currentKVal;
+    dVal = currentDVal;
+    htfRsiValue = currentHTFRSIVal;
+    isBullish = currentIsBullish;
+    isBearish = currentIsBearish;
+    buyCond = currentBuyCond;
+    sellCond = currentSellCond;
 
-    ema20 = XAverage(Close, 20);
+    // Calculate Stop Loss and Take Profit distances based on the current ATR value.
+    // These are for visual plotting in the indicator.
+    If AtrVal > 0 then begin // Ensure AtrVal is valid
+        StopLossDistance = StopLossATRMultiplier * AtrVal;
+        TakeProfitDistance = StopLossDistance * RiskRewardRatio;
+        priceOffsetForShape = AtrVal * 0.25; // Offset for plotting buy/sell shapes above/below bar.
+    end else begin
+        StopLossDistance = 0;
+        TakeProfitDistance = 0;
+        priceOffsetForShape = Low*0.0025; // Small fallback if ATR is zero
+    end;
 
-    AtrVal = AvgTrueRange(14);
-    StopLossDistance = StopLossATRMultiplier * AtrVal;
-    TakeProfitDistance = StopLossDistance * RiskRewardRatio;
-    priceOffsetForShape = AtrVal * 0.25; // For positioning plot shapes
 
-    rsiVal = RSI(Close, RSILength);
-
-    If TimeframeHigherSymbolActive and BarType of Data2 > 0 Then Begin 
-        htfRsiValue = RSI(Close of Data2, RSILength); 
-    End Else Begin
-        htfRsiValue = rsiVal; 
-    End;
-
-    If Highest(rsiVal, StochLength) - Lowest(rsiVal, StochLength) > 0 then 
-        rawStochRSI = 100 * (rsiVal - Lowest(rsiVal, StochLength)) / (Highest(rsiVal, StochLength) - Lowest(rsiVal, StochLength))
-    else 
-        rawStochRSI = 50; // Default if RSI is flat
-
-    kVal = Average(rawStochRSI, 3); 
-    dVal = Average(kVal, 3);       
-
-    htfRsiBullish = (not TimeframeHigherSymbolActive) or htfRsiValue > 50;
-    htfRsiBearish = (not TimeframeHigherSymbolActive) or htfRsiValue < 50;
-
-    isBullish = rsiVal > rsiVal[1] and kVal > dVal and htfRsiBullish;
-    isBearish = rsiVal < rsiVal[1] and kVal < dVal and htfRsiBearish;
-
-    buyCond = Close Crosses Over Open and Low < Open and isBullish;
-    sellCond = Close Crosses Under Open and High > Open and isBearish;
-
+    // Manage trade state and SL/TP values for plotting purposes.
+    // (Indicator does not execute trades, but simulates for visual cues).
     Variable: lastLatestBuyAverage(NO_PLOT_VALUE), lastLatestSellAverage(NO_PLOT_VALUE);
     lastLatestBuyAverage = latestBuyAverage;
     lastLatestSellAverage = latestSellAverage;
 
-    If buyCond Then Begin
-        latestBuyAverage = Close;
-        buySL = latestBuyAverage - StopLossDistance;
-        buyTP = latestBuyAverage + TakeProfitDistance;
-        latestSellAverage = NO_PLOT_VALUE; 
+    If buyCond Then Begin // If a buy condition is met
+        latestBuyAverage = Close; // Record the buy price (Close of the signal bar)
+        buySL = latestBuyAverage - StopLossDistance;    // Calculate theoretical SL
+        buyTP = latestBuyAverage + TakeProfitDistance;   // Calculate theoretical TP
+        latestSellAverage = NO_PLOT_VALUE; // Reset any previous sell signal state
         sellSL = NO_PLOT_VALUE;
         sellTP = NO_PLOT_VALUE;
     End;
 
-    If sellCond Then Begin
-        latestSellAverage = Close;
-        sellSL = latestSellAverage + StopLossDistance; 
-        sellTP = latestSellAverage - TakeProfitDistance;
-        latestBuyAverage = NO_PLOT_VALUE; 
+    If sellCond Then Begin // If a sell condition is met
+        latestSellAverage = Close; // Record the sell price
+        sellSL = latestSellAverage + StopLossDistance;   // Calculate theoretical SL
+        sellTP = latestSellAverage - TakeProfitDistance;  // Calculate theoretical TP
+        latestBuyAverage = NO_PLOT_VALUE; // Reset any previous buy signal state
         buySL = NO_PLOT_VALUE;
         buyTP = NO_PLOT_VALUE;
     End;
 
+    // Check if the buy/sell average price has changed since the last bar.
     buyChanged = (latestBuyAverage <> NO_PLOT_VALUE and latestBuyAverage <> lastLatestBuyAverage);
     sellChanged = (latestSellAverage <> NO_PLOT_VALUE and latestSellAverage <> lastLatestSellAverage);
     
+    // Update plotting variables for SL/TP lines.
     If latestBuyAverage <> NO_PLOT_VALUE Then Begin
         plotBuySL = buySL;
         plotBuyTP = buyTP;
-    End Else Begin
+    End Else Begin // If no active buy signal, don't plot its SL/TP.
         plotBuySL = NO_PLOT_VALUE;
         plotBuyTP = NO_PLOT_VALUE;
     End;
@@ -230,35 +189,38 @@ If CurrentBar > 1 Then Begin
     If latestSellAverage <> NO_PLOT_VALUE Then Begin
         plotSellSL = sellSL;
         plotSellTP = sellTP;
-    End Else Begin
+    End Else Begin // If no active sell signal, don't plot its SL/TP.
         plotSellSL = NO_PLOT_VALUE;
         plotSellTP = NO_PLOT_VALUE;
     End;
 
+    // Previous Wick Analysis: Calculate high, low, and mean of the previous bar's wick.
     If ShowWickAnalysis Then Begin
-        prevHighWick = High[1];
-        prevLowWick = Low[1];
-        prevMeanWick = (prevHighWick + prevLowWick) / 2;
-    End Else Begin
+        prevHighWick = High[1];    // Previous bar's high
+        prevLowWick = Low[1];     // Previous bar's low
+        prevMeanWick = (prevHighWick + prevLowWick) / 2; // Mid-point of previous wick
+    End Else Begin // If not showing, set plot values to "no plot".
         prevHighWick = NO_PLOT_VALUE;
         prevLowWick = NO_PLOT_VALUE;
         prevMeanWick = NO_PLOT_VALUE;
     End;
 
+    // Determine value and color for the signal fill plot.
     If latestBuyAverage <> NO_PLOT_VALUE Then
         fillPlotValue = latestBuyAverage
     Else If latestSellAverage <> NO_PLOT_VALUE Then
         fillPlotValue = latestSellAverage
     Else
-        fillPlotValue = NO_PLOT_VALUE;
+        fillPlotValue = NO_PLOT_VALUE; // No fill if no active signal.
 
-    If isBullish Then
+    If isBullish Then // Overall bullish state
         fillPlotColor = colorLime
-    Else If isBearish Then
+    Else If isBearish Then // Overall bearish state
         fillPlotColor = colorRed
-    Else
+    Else // Neutral state
         fillPlotColor = colorGray;
         
+    // Alerts for Buy/Sell conditions.
     If buyCond Then
         Alert("Sniper Buy: " + GetSymbolName + " @ " + NumToStr(Close, NumToStrCount(MinMove / PriceScale,0)));
     If sellCond Then
@@ -267,49 +229,58 @@ End;
 
 
 // ========== PLOTTING ==========
+// This section handles all visual plotting on the chart.
+
+// Plot 1: Average SMA Trend (as columns)
 Plot1(AverageSMA, "AvgSMA_Trend", Color.Gray, Default, 2); 
-SetPlotStyle(1, 1); // 1 = styleHistogram (columns)
+SetPlotStyle(1, 1); // Style: Histogram (columns)
 If AverageSMA <> NO_PLOT_VALUE And AverageSMA[1] <> NO_PLOT_VALUE Then Begin
-    If AverageSMA > AverageSMA[1] Then
+    If AverageSMA > AverageSMA[1] Then // If AvgSMA is rising
         SetPlotColor(1, colorTeal)
-    Else If AverageSMA < AverageSMA[1] Then 
+    Else If AverageSMA < AverageSMA[1] Then // If AvgSMA is falling
         SetPlotColor(1, colorMaroon);
 End;
 
-Plot2(ema20, "EMA20", Color.Gray, Default, 3); 
-SetPlotStyle(2, 7); // 7 = styleArea
-If Close > ema20 Then
+// Plot 2: Exponential Moving Average (as area)
+Plot2(emaValue, "EMA", Color.Gray, Default, 3); // Use emaValue which comes from currentEMA
+SetPlotStyle(2, 7); // Style: Area
+If Close > emaValue Then // If Close is above EMA
     SetPlotColor(2, colorTeal)
-Else If Close < ema20 Then
+Else If Close < emaValue Then // If Close is below EMA
     SetPlotColor(2, colorMaroon);
 
+// Plot 3 & 4: Latest Buy and Sell Average Prices
 Plot3(latestBuyAverage, "LatestBuy", Iff(buyChanged, colorLime, Color.DarkGray), Default, 2);
 Plot4(latestSellAverage, "LatestSell", Iff(sellChanged, colorRed, Color.DarkGray), Default, 2);
 
-Plot5(plotBuySL, "BuySL", colorMaroon, Default, 1); SetPlotStyle(5, 2); // Dashed
-Plot6(plotBuyTP, "BuyTP", Color.DarkGreen, Default, 1); SetPlotStyle(6, 2); // Dashed
-Plot7(plotSellSL, "SellSL", colorMaroon, Default, 1); SetPlotStyle(7, 2); // Dashed
-Plot8(plotSellTP, "SellTP", Color.DarkGreen, Default, 1); SetPlotStyle(8, 2); // Dashed
+// Plot 5, 6, 7, 8: Buy and Sell Stop Loss and Take Profit Lines (dashed lines)
+Plot5(plotBuySL, "BuySL", colorMaroon, Default, 1); SetPlotStyle(5, 2); // Style: Dashed
+Plot6(plotBuyTP, "BuyTP", Color.DarkGreen, Default, 1); SetPlotStyle(6, 2);
+Plot7(plotSellSL, "SellSL", colorMaroon, Default, 1); SetPlotStyle(7, 2);
+Plot8(plotSellTP, "SellTP", Color.DarkGreen, Default, 1); SetPlotStyle(8, 2);
 
+// Plot 9 & 10: Buy and Sell Condition Shapes (triangles)
 If buyCond Then
     Plot9(High + priceOffsetForShape, "BuyShape", colorLime, Default, 2) 
 Else
     Plot9(NO_PLOT_VALUE); 
-SetPlotStyle(9, 3); // 3 = StyleTriangleUp 
+SetPlotStyle(9, 3); // Style: Triangle Up
 
 If sellCond Then
     Plot10(Low - priceOffsetForShape, "SellShape", colorRed, Default, 2) 
 Else
     Plot10(NO_PLOT_VALUE);
-SetPlotStyle(10, 4); // 4 = StyleTriangleDown 
+SetPlotStyle(10, 4); // Style: Triangle Down
 
+// Plot 11: Signal Fill Area
 Plot11(fillPlotValue, "SignalFill", fillPlotColor, Default, 1);
-SetPlotStyle(11, 1); // styleHistogram
+SetPlotStyle(11, 1); // Style: Histogram (can create a fill effect between lines if values are set appropriately)
 
+// Plot 12, 13, 14: Previous Wick Analysis (circles and cross)
 If ShowWickAnalysis Then Begin
-    Plot12(prevHighWick, "PrevTopWick", colorRed, Default, 1); SetPlotStyle(12, 5); // 5 = styleCircle
-    Plot13(prevLowWick, "PrevBottomWick", Color.DarkGreen, Default, 1); SetPlotStyle(13, 5); // styleCircle
-    Plot14(prevMeanWick, "PrevMeanWick", colorSilver, Default, 1); SetPlotStyle(14, 6); // 6 = styleCross
+    Plot12(prevHighWick, "PrevTopWick", colorRed, Default, 1); SetPlotStyle(12, 5); // Style: Circle
+    Plot13(prevLowWick, "PrevBotWick", Color.DarkGreen, Default, 1); SetPlotStyle(13, 5);
+    Plot14(prevMeanWick, "PrevMeanWick", colorSilver, Default, 1); SetPlotStyle(14, 6); // Style: Cross
 End Else Begin // Ensure plots are cleared if not shown
     Plot12(NO_PLOT_VALUE); Plot13(NO_PLOT_VALUE); Plot14(NO_PLOT_VALUE);
 End;

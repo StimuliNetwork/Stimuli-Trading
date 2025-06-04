@@ -1,0 +1,126 @@
+// Function: OptimizeWhipsawSMA
+// Description: Encapsulates the one-time whipsaw optimization logic to find the best fast and slow SMA lengths.
+//              This function is designed to be called once per chart analysis, typically after a certain number of bars have loaded.
+// Inputs:
+//   WhipsawWindow_PARAM (NumericSimple) - The window size (number of bars) to define a whipsaw event.
+//   MaxLookback_PARAM (NumericSimple)   - The maximum number of historical bars to scan for optimization.
+//   DataSeriesClose (NumericSeries)     - The closing prices of the data series (e.g., Close of Data1) to use for optimization.
+// Outputs (by reference):
+//   oBestFast (NumericRef)     - The determined optimal fast Simple Moving Average (SMA) length.
+//   oBestSlow (NumericRef)     - The determined optimal slow Simple Moving Average (SMA) length.
+//   oMinWhipsaws (NumericRef)  - The minimum number of whipsaws found with the optimal SMA pair.
+
+Function OptimizeWhipsawSMA(NumericSimple WhipsawWindow_PARAM, NumericSimple MaxLookback_PARAM, NumericSeries DataSeriesClose, NumericRef oBestFast, NumericRef oBestSlow, NumericRef oMinWhipsaws)
+
+Constants:
+    MIN_FAST_MA_OPT(8),      // Minimum Fast MA length to test in optimization.
+    MAX_FAST_MA_OPT(20),     // Maximum Fast MA length to test in optimization.
+    MAX_SLOW_MA_OPT(21);     // Maximum Slow MA length to test in optimization.
+    // Note: The condition to run this (e.g. CurrentBar = MIN_BARS_FOR_OPTIMIZATION) is managed by the calling script.
+
+Variables:
+    // Static variable to ensure the core optimization logic runs only once per chart instance.
+    Static onceFunctionRan(false),
+
+    // Loop variables for optimization
+    fastLoop(0),
+    slowLoop(0),
+    iLoop(0),
+    maxBarsToScanForOpt(0),
+    whipsawCount(0),
+    lastCrossoverBarIndexInScan(0),
+    bLastCrossAboveInScan(false),
+    smaFastI(0),
+    smaSlowI(0),
+    smaFastPrev(0),
+    smaSlowPrev(0),
+    bCrossUpInScan(false),
+    bCrossDownInScan(false);
+
+Begin
+    // Ensure this core logic runs only once.
+    If onceFunctionRan = false Then Begin
+        onceFunctionRan = true;
+
+        // Initialize output parameters to default/non-optimized values.
+        oBestFast = 0;
+        oBestSlow = 0;
+        oMinWhipsaws = 100000; // Initialize with a high number for minimization.
+
+        // Determine the number of bars available for scanning.
+        // BarNumber is 1-based count of total bars in chart (e.g. 1st bar is BarNumber = 1).
+        // maxBarsToScanForOpt will be the number of historical bars *prior* to the current bar (if CurrentBar is the trigger point).
+        // If optimization is triggered on CurrentBar = 101, then BarNumber is 101.
+        // We want to scan bars up to, but not including, the current bar. So BarNumber - 1 is the max available historical index (0-based).
+        // MaxLookback_PARAM is the user-defined limit.
+        If BarNumber > 1 then // Need at least one historical bar to scan.
+            maxBarsToScanForOpt = MinList(BarNumber - 1, MaxLookback_PARAM)
+        else
+            maxBarsToScanForOpt = 0; // No historical bars to scan.
+
+        // Provide feedback if MaxLookback_PARAM was limited by available data.
+        If MaxLookback_PARAM > maxBarsToScanForOpt and BarNumber > 1 Then Begin // Check BarNumber > 1 to avoid msg on very first bars
+            Print(DateToString(Date), " ", TimeToString(Time), " Whipsaw Opt Info: Scan range (", NumToStr(maxBarsToScanForOpt,0), " bars) is limited by available data (", NumToStr(BarNumber-1,0), "), less than MaxLookback input (", NumToStr(MaxLookback_PARAM,0), ").");
+        End;
+
+        // Check if there's enough data for a meaningful optimization scan.
+        // Longest SMA (MAX_SLOW_MA_OPT) + WhipsawWindow_PARAM + allowance for previous SMA calc (+1).
+        If maxBarsToScanForOpt < WhipsawWindow_PARAM + MAX_SLOW_MA_OPT + 1 Then Begin
+            Print(DateToString(Date), " ", TimeToString(Time), " OptimizeWhipsawSMA Warning: Not enough data for full optimization. Scannable bars=", NumToStr(maxBarsToScanForOpt,0),
+                  ", Required approx. ", NumToStr(WhipsawWindow_PARAM + MAX_SLOW_MA_OPT + 1,0), " historical bars.");
+            Return; // Exit function if data is insufficient.
+        End;
+
+        // Loop through potential Fast SMA lengths.
+        For fastLoop = MIN_FAST_MA_OPT To MAX_FAST_MA_OPT Begin
+            // Loop through potential Slow SMA lengths (must be greater than Fast SMA).
+            For slowLoop = fastLoop + 1 To MAX_SLOW_MA_OPT Begin
+                whipsawCount = 0;
+                lastCrossoverBarIndexInScan = 0;
+                bLastCrossAboveInScan = false;
+
+                // Iterate through historical bars to count whipsaws.
+                // iLoop represents the displacement (number of bars ago from the *current bar at time of call*)
+                // for the *end* of the SMA calculation window.
+                // Loop from 1 bar ago up to (maxBarsToScanForOpt - WhipsawWindow_PARAM - MAX_SLOW_MA_OPT) bars ago
+                // Displacement 0 is current bar, 1 is previous bar.
+                // The loop must ensure that iLoop + 1 + MAX_SLOW_MA_OPT (or fastLoop) does not exceed maxBarsToScanForOpt.
+                // Max displacement for Average(Series, Length)[Displacement] is maxBarsToScanForOpt - Length + 1.
+                // Let's ensure iLoop + 1 (for smaSlowPrev) is within the scannable range.
+                For iLoop = 1 To maxBarsToScanForOpt - WhipsawWindow_PARAM - MAX_SLOW_MA_OPT Begin
+                    smaFastI = Average(DataSeriesClose, fastLoop)[iLoop];
+                    smaSlowI = Average(DataSeriesClose, slowLoop)[iLoop];
+                    smaFastPrev = Average(DataSeriesClose, fastLoop)[iLoop + 1];
+                    smaSlowPrev = Average(DataSeriesClose, slowLoop)[iLoop + 1];
+
+                    bCrossUpInScan = smaFastPrev < smaSlowPrev and smaFastI > smaSlowI;
+                    bCrossDownInScan = smaFastPrev > smaSlowPrev and smaFastI < smaSlowI;
+
+                    If bCrossUpInScan or bCrossDownInScan Then Begin
+                        If lastCrossoverBarIndexInScan <> 0 and iLoop - lastCrossoverBarIndexInScan <= WhipsawWindow_PARAM Then Begin
+                            If (bCrossUpInScan and not bLastCrossAboveInScan) or (bCrossDownInScan and bLastCrossAboveInScan) Then Begin
+                                whipsawCount = whipsawCount + 1;
+                            End;
+                        End;
+                        lastCrossoverBarIndexInScan = iLoop;
+                        bLastCrossAboveInScan = bCrossUpInScan;
+                    End;
+                End;
+
+                If whipsawCount < oMinWhipsaws Then Begin
+                    oMinWhipsaws = whipsawCount;
+                    oBestFast = fastLoop;
+                    oBestSlow = slowLoop;
+                End;
+            End;
+        End;
+
+        If oBestFast = 0 and oBestSlow = 0 then begin
+             Print(DateToString(Date), " ", TimeToString(Time), " OptimizeWhipsawSMA Results: Opt. did not find a valid SMA pair. MinWhipsaws recorded: ", NumToStr(oMinWhipsaws,0),
+                   ". Consider adjusting parameters or checking data. Scanned ", NumToStr(maxBarsToScanForOpt,0), " bars.");
+        end else begin
+            Print(DateToString(Date), " ", TimeToString(Time), " OptimizeWhipsawSMA Results: BestFast=", NumToStr(oBestFast,0), ", BestSlow=", NumToStr(oBestSlow,0),
+                  ", MinWhipsaws=", NumToStr(oMinWhipsaws,0), ". Scanned ", NumToStr(maxBarsToScanForOpt,0), " bars.");
+        end;
+    End;
+End;
